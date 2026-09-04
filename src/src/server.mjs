@@ -18,7 +18,11 @@ const app = express();
 const port = Number(process.env.PORT || 8787);
 const scoringSecret = process.env.SCORING_SECRET || '';
 const dealCategoryId = process.env.BITRIX24_DEAL_CATEGORY_ID ?? '0';
+const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS || 30000);
+const pollLookbackMinutes = Number(process.env.POLL_LOOKBACK_MINUTES || 10);
+const pollBatchSize = Number(process.env.POLL_BATCH_SIZE || 50);
 const bitrix = new BitrixClient(process.env.BITRIX24_WEBHOOK_URL);
+let pollerRunning = false;
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -52,72 +56,49 @@ async function handleScoringRequest(request, response) {
       return;
     }
 
-    const inputHash = calculateScoringInputHash(deal);
-    const estimateInputHash = calculateEstimateInputHash(deal);
-    const skippedByInputHash = shouldSkipScoringUpdate(deal, inputHash);
-    const skippedEstimateByInputHash = shouldSkipEstimateUpdate(deal, estimateInputHash);
-    const scoring = calculateScoring(deal);
-    const estimate = calculateEstimatePlan(deal);
-    const fields = {
-      ...(!skippedByInputHash ? buildUpdateFields(scoring, inputHash) : {}),
-      ...(!skippedEstimateByInputHash ? buildEstimateUpdateFields(estimate, estimateInputHash) : {})
-    };
+    const result = buildDealProcessingResult(deal);
     if (request.query.dryRun === '1' || request.body.dryRun === '1' || request.body.dryRun === true) {
       console.log(JSON.stringify({
         event: 'scoring.dryRun',
         dealId,
-        recommendation: scoring.recommendation,
-        skippedByInputHash,
-        skippedEstimateByInputHash
+        recommendation: result.scoring.recommendation,
+        skippedByInputHash: result.skippedByInputHash,
+        skippedEstimateByInputHash: result.skippedEstimateByInputHash
       }));
       response.json({
         ok: true,
         dealId,
         dryRun: true,
-        skipped: skippedByInputHash && skippedEstimateByInputHash,
-        fields
+        skipped: result.skipped,
+        fields: result.fields
       });
       return;
     }
 
-    if (skippedByInputHash && skippedEstimateByInputHash) {
-      console.log(JSON.stringify({ event: 'scoring.skip', dealId, reason: 'Inputs are unchanged', recommendation: scoring.recommendation }));
+    if (result.skipped) {
+      console.log(JSON.stringify({ event: 'scoring.skip', dealId, reason: 'Inputs are unchanged', recommendation: result.scoring.recommendation }));
       response.json({
         ok: true,
         dealId,
         skipped: true,
         reason: 'Inputs are unchanged',
-        recommendation: scoring.recommendation
+        recommendation: result.scoring.recommendation
       });
       return;
     }
 
-    const changed = Object.entries(fields).some(([field, nextValue]) => String(deal[field] || '') !== String(nextValue));
-
-    if (!changed) {
-      console.log(JSON.stringify({ event: 'scoring.skip', dealId, reason: 'Scoring fields are already up to date', recommendation: scoring.recommendation }));
-      response.json({
-        ok: true,
-        dealId,
-        skipped: true,
-        reason: 'Scoring fields are already up to date',
-        recommendation: scoring.recommendation
-      });
-      return;
-    }
-
-    await bitrix.updateDeal(dealId, fields);
+    await bitrix.updateDeal(dealId, result.fields);
     console.log(JSON.stringify({
       event: 'scoring.updated',
       dealId,
-      recommendation: scoring.recommendation
+      recommendation: result.scoring.recommendation
     }));
 
     response.json({
       ok: true,
       dealId,
-      recommendation: scoring.recommendation,
-      reason: scoring.reason
+      recommendation: result.scoring.recommendation,
+      reason: result.scoring.reason
     });
   } catch (error) {
     console.error(error);
@@ -134,6 +115,28 @@ function hasValidSecret(request) {
   );
 }
 
+function buildDealProcessingResult(deal) {
+  const inputHash = calculateScoringInputHash(deal);
+  const estimateInputHash = calculateEstimateInputHash(deal);
+  const skippedByInputHash = shouldSkipScoringUpdate(deal, inputHash);
+  const skippedEstimateByInputHash = shouldSkipEstimateUpdate(deal, estimateInputHash);
+  const scoring = calculateScoring(deal);
+  const estimate = calculateEstimatePlan(deal);
+  const fields = {
+    ...(!skippedByInputHash ? buildUpdateFields(scoring, inputHash) : {}),
+    ...(!skippedEstimateByInputHash ? buildEstimateUpdateFields(estimate, estimateInputHash) : {})
+  };
+  const changed = Object.entries(fields).some(([field, nextValue]) => String(deal[field] || '') !== String(nextValue));
+
+  return {
+    scoring,
+    fields,
+    skippedByInputHash,
+    skippedEstimateByInputHash,
+    skipped: (skippedByInputHash && skippedEstimateByInputHash) || !changed
+  };
+}
+
 function extractDealId(body = {}) {
   return (
     body.dealId ||
@@ -147,4 +150,79 @@ function extractDealId(body = {}) {
 
 app.listen(port, () => {
   console.log(`Bitrix24 scoring handler is listening on ${port}`);
+  startPoller();
 });
+
+function startPoller() {
+  if (!pollIntervalMs || pollIntervalMs < 1000) return;
+
+  console.log(JSON.stringify({
+    event: 'poller.started',
+    intervalMs: pollIntervalMs,
+    lookbackMinutes: pollLookbackMinutes,
+    batchSize: pollBatchSize
+  }));
+
+  setInterval(() => {
+    runPollerOnce().catch((error) => {
+      console.error(JSON.stringify({ event: 'poller.error', message: error.message }));
+    });
+  }, pollIntervalMs);
+}
+
+async function runPollerOnce() {
+  if (pollerRunning) {
+    console.log(JSON.stringify({ event: 'poller.skip', reason: 'Previous run is still active' }));
+    return;
+  }
+
+  pollerRunning = true;
+  try {
+    const modifiedAfter = new Date(Date.now() - pollLookbackMinutes * 60 * 1000).toISOString();
+    const deals = await bitrix.call('crm.deal.list', {
+      order: { DATE_MODIFY: 'DESC' },
+      filter: {
+        CATEGORY_ID: dealCategoryId,
+        '>DATE_MODIFY': modifiedAfter
+      },
+      select: [
+        'ID',
+        'TITLE',
+        'DATE_MODIFY',
+        'CATEGORY_ID',
+        'STAGE_ID',
+        'UF_CRM_1759405287275',
+        'UF_CRM_1761812533674',
+        'UF_CRM_SC_BUDGET',
+        'UF_CRM_SC_LPR',
+        'UF_CRM_SC_INTEREST',
+        'UF_CRM_SC_REQUEST',
+        'UF_CRM_SC_RECOMM',
+        'UF_CRM_SC_REASON',
+        'UF_CRM_SC_INPUT_HASH',
+        'UF_CRM_EST_FORMAT',
+        'UF_CRM_EST_PLAN_HOURS',
+        'UF_CRM_EST_INPUT_HASH'
+      ],
+      start: 0
+    });
+
+    let updated = 0;
+    for (const deal of deals.slice(0, pollBatchSize)) {
+      const result = buildDealProcessingResult(deal);
+      if (result.skipped) continue;
+
+      await bitrix.updateDeal(deal.ID, result.fields);
+      updated += 1;
+      console.log(JSON.stringify({
+        event: 'poller.updated',
+        dealId: deal.ID,
+        recommendation: result.scoring.recommendation
+      }));
+    }
+
+    console.log(JSON.stringify({ event: 'poller.done', scanned: deals.length, updated }));
+  } finally {
+    pollerRunning = false;
+  }
+}
