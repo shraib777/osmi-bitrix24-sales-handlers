@@ -310,10 +310,17 @@ export class LegalArchiver {
     if (refs.some(x => x.length !== 1)) return;
     const key = sha(stable({ sources: refs.map(x => String(x[0].id)), context: businessContext(item) }));
     const name = `checkpoint-${spec.key}-${key}.json`;
+    const matches = (state, cp) => cp && cp.key === key && cp.typeId === TYPE_ID && String(cp.itemId) === String(item.id) &&
+      spec.targets.every((target, i) => fileRefs(state[P + target]).length === 1 && String(fileRefs(state[P + target])[0]?.id) === String(cp.targetIds[i]));
+    const copyName = ids => `checkpoint-${spec.key}-${key}-copy-${sha(stable(ids))}.json`;
     let saved = await this.store.find(folder, name);
     let checkpoint = saved ? await this.store.readJson(saved) : null;
-    const matches = (state, cp) => cp && cp.key === key && cp.typeId === TYPE_ID && String(cp.itemId) === String(item.id) &&
-      spec.targets.every((target, i) => String(fileRefs(state[P + target])[0]?.id) === String(cp.targetIds[i]));
+    // Returning to a previously approved context can require a fresh RPA copy.
+    // Resolve its own immutable receipt instead of replacing the first receipt.
+    if (checkpoint && !matches(item, checkpoint)) {
+      const copy = await this.store.find(folder, copyName(spec.targets.map(target => String(fileRefs(item[P + target])[0]?.id))));
+      if (copy) { saved = copy; checkpoint = await this.store.readJson(copy); }
+    }
     const bindingsMatch = spec.sources.every((s, i) => String(item[P + SOURCE_KEYS[s]]) === String(refs[i][0].id));
     if (item[P + spec.key] === key && matches(item, checkpoint) && bindingsMatch) return;
     const current = await this.api.getItem(item.id);
@@ -343,11 +350,13 @@ export class LegalArchiver {
     }
     checkpoint = { schema: 1, typeId: TYPE_ID, itemId: item.id, key, sourceIds: refs.map(x => String(x[0].id)),
       targetIds, context: businessContext(item) };
-    // A checkpoint file can already exist for this source/context but reference a
-    // prior snapshot. Keep it immutable; make the key identify the restored copy
-    // only after verifying bytes. A mismatched immutable record fails closed.
-    if (saved && stable(await this.store.readJson(saved)) !== stable(checkpoint)) throw new ArchiveError('CHECKPOINT_SNAPSHOT_CHANGED');
-    if (!saved) { await this.lease.assert(); await this.store.putJson(folder, name, checkpoint); }
+    let receiptName = name;
+    if (saved && stable(await this.store.readJson(saved)) !== stable(checkpoint)) {
+      receiptName = copyName(targetIds);
+      saved = await this.store.find(folder, receiptName);
+      if (saved && stable(await this.store.readJson(saved)) !== stable(checkpoint)) throw new ArchiveError('CHECKPOINT_SNAPSHOT_CHANGED');
+    }
+    if (!saved) { await this.lease.assert(); await this.store.putJson(folder, receiptName, checkpoint); }
     const final = await this.api.getItem(item.id);
     if (fingerprint(final) !== fingerprint(item) || !matches(final, checkpoint)) throw new ArchiveError('ITEM_CHANGED_DURING_CAPTURE');
     const fields = { [P + spec.key]: key };
