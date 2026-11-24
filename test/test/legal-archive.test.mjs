@@ -148,6 +148,37 @@ test('context change including source attachments creates a new version', async 
   f.api.item[P + 'SOURCE_FILES'] = [{ id: '999' }]; await f.process();
   assert.notEqual(f.api.item[P + 'VERSION_KEY'], before);
 });
+test('return to an earlier context keeps both immutable receipts and survives restart', async () => {
+  const f = await fixture(); await f.process();
+  const key = f.api.item[P + 'VERSION_KEY'];
+  const firstReceipt = [...f.api.disk.values()].find(x => x.NAME.startsWith('checkpoint-'));
+  const firstBytes = Buffer.from(f.api.data.get(firstReceipt.ID));
+  f.api.item[P + 'REQUEST_TEXT'] = 'Changed facts'; await f.process();
+  assert.notEqual(f.api.item[P + 'VERSION_KEY'], key);
+  f.api.item[P + 'REQUEST_TEXT'] = 'Synthetic'; await f.process();
+  assert.equal(f.api.item[P + 'VERSION_KEY'], key);
+  assert.deepEqual(f.api.data.get(firstReceipt.ID), firstBytes);
+  assert.equal([...f.api.disk.values()].filter(x => x.NAME.includes('-copy-')).length, 1);
+  const before = mutations(f.api).length;
+  await new LegalArchiver(f.api, new DiskStore(f.api, 99), f.lease).process(structuredClone(f.api.item));
+  assert.equal(mutations(f.api).length, before);
+  assert.equal(f.api.item[P + 'PROJECT_HISTORY'].length, 1);
+});
+test('replacement of an approval copy is verified and recorded without rewriting history', async () => {
+  const f = await fixture(); await f.process();
+  const key = f.api.item[P + 'VERSION_KEY'];
+  f.api.attach('CLIENT_DOCUMENT', 'wrong replacement'); await f.process();
+  assert.equal(f.api.item[P + 'VERSION_KEY'], key);
+  assert.equal((await f.api.download(f.api.item[P + 'CLIENT_DOCUMENT'])).bytes.toString(), 'test document');
+  assert.equal([...f.api.disk.values()].filter(x => x.NAME.includes('-copy-')).length, 1);
+});
+test('corruption during an earlier-context restoration cannot publish a ready copy', async () => {
+  const f = await fixture(); await f.process();
+  f.api.item[P + 'REQUEST_TEXT'] = 'Changed facts'; await f.process();
+  f.api.item[P + 'REQUEST_TEXT'] = 'Synthetic'; f.api.corruptSnapshots = true;
+  await assert.rejects(f.process(), /SNAPSHOT_COPY_NOT_VERIFIED/);
+  assert.equal(f.api.item[P + 'VERSION_KEY'], '');
+});
 test('concurrent source change cannot publish the stale snapshot', async () => {
   const f = await fixture(); f.api.onDownload = () => f.api.attach('LEGAL_PROJECT', 'new text');
   await assert.rejects(f.process(), /ITEM_CHANGED_DURING_CAPTURE/);
