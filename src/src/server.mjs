@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import { startLegalArchiveSafely } from './legal-archive.mjs';
 import { BitrixClient } from './bitrix.mjs';
 import {
   buildUpdateFields,
@@ -23,6 +24,8 @@ const pollLookbackMinutes = Number(process.env.POLL_LOOKBACK_MINUTES || 10);
 const pollBatchSize = Number(process.env.POLL_BATCH_SIZE || 50);
 const bitrix = new BitrixClient(process.env.BITRIX24_WEBHOOK_URL);
 let pollerRunning = false;
+let scoringPollTimer;
+let scoringPollPromise;
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -148,9 +151,22 @@ function extractDealId(body = {}) {
   );
 }
 
-app.listen(port, () => {
-  console.log(`Bitrix24 scoring handler is listening on ${port}`);
+let legalArchive;
+const server = app.listen(port, () => {
+  console.log(`Bitrix24 scoring handler is listening on ${server.address().port}`);
   startPoller();
+  legalArchive = startLegalArchiveSafely();
+});
+
+let shuttingDown = false;
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(scoringPollTimer);
+  const deadline = setTimeout(() => process.exit(0), 25000);
+  deadline.unref();
+  Promise.all([new Promise(resolve => server.close(resolve)), legalArchive?.stop(), scoringPollPromise])
+    .finally(() => process.exit(0));
 });
 
 function startPoller() {
@@ -163,8 +179,8 @@ function startPoller() {
     batchSize: pollBatchSize
   }));
 
-  setInterval(() => {
-    runPollerOnce().catch((error) => {
+  scoringPollTimer = setInterval(() => {
+    scoringPollPromise = runPollerOnce().catch((error) => {
       console.error(JSON.stringify({ event: 'poller.error', message: error.message }));
     });
   }, pollIntervalMs);
