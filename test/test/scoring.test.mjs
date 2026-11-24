@@ -8,7 +8,7 @@ import {
   FIELDS,
   scoringInputSnapshot,
   shouldSkipScoringUpdate
-} from '../src/scoring.mjs';
+} from '../../src/src/scoring.mjs';
 import {
   buildEstimateUpdateFields,
   calculateEstimateInputHash,
@@ -17,7 +17,7 @@ import {
   ESTIMATE_FIELDS,
   ESTIMATE_FORMAT_RULES,
   shouldSkipEstimateUpdate
-} from '../src/estimate.mjs';
+} from '../../src/src/estimate.mjs';
 
 function deal(values) {
   return {
