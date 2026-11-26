@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-// Only the development RPA is enabled by this integration. No AI, email,
-// approval decisions, stage changes, or public archive endpoints.
+// Only the development RPA is enabled. No AI, email, approval decisions,
+// or public archive endpoints. Cancellation is separately gated below.
 export const TYPE_ID = 57;
 export const P = 'UF_RPA_57_';
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -390,12 +390,128 @@ export class LegalArchiver {
   }
 }
 
+// Feed comments are the audited source of a cancellation request. Never infer
+// its author from item.updatedBy: background archival also updates that field.
+export class LegalProcessControls {
+  constructor(api, lease) { this.api = api; this.lease = lease; }
+  async timeline(itemId) {
+    const rows = []; let start = 0;
+    for (;;) {
+      const page = await this.api.call('rpa.timeline.listForItem', { typeId: TYPE_ID, itemId, start });
+      const batch = page.result?.timeline;
+      if (!Array.isArray(batch)) throw new ArchiveError('INVALID_TIMELINE');
+      if (batch.some(r => Number(r.typeId) !== TYPE_ID || String(r.itemId) !== String(itemId))) throw new ArchiveError('TIMELINE_OUTSIDE_ITEM');
+      rows.push(...batch);
+      if (page.next === undefined && batch.length < 50) return rows;
+      const next = Number(page.next ?? start + 50);
+      if (next <= start) throw new ArchiveError('INVALID_PAGINATION');
+      start = next;
+    }
+  }
+  async commentOnce(itemId, marker, message) {
+    if ((await this.timeline(itemId)).some(r => r.action === 'comment' && Number(r.userId) === 1 && String(r.description).includes(marker))) return;
+    await this.lease.assert();
+    await this.api.call('rpa.comment.add', { typeId: TYPE_ID, itemId, fields: { description: `${message}\n${marker}` } });
+  }
+  async reportError(itemId, error) {
+    const code = error instanceof ArchiveError && /^[A-Z_]{1,80}$/.test(error.code) ? error.code : 'UNEXPECTED_ERROR';
+    // A lost lease must stop this instance, not let it write alongside the owner.
+    await this.lease.assert();
+    let item = await this.api.getItem(itemId);
+    const signature = sha(stable({ code, input: fingerprint(item) }));
+    const previous = String(item[P + 'TECH_ERROR_KEY'] || '');
+    let event = previous.startsWith(signature + ':') ? previous : `${signature}:${randomUUID()}:new`;
+    const message = `Техническая ошибка автоматизации (${code}). Обработка будет повторена автоматически. Если ошибка сохраняется, обратитесь к администратору.`;
+    if (item[P + 'TECH_ERROR'] !== message || previous !== event) {
+      await this.api.updateItem(itemId, { [P + 'TECH_ERROR']: message, [P + 'TECH_ERROR_KEY']: event });
+    }
+    const episode = event.split(':')[1];
+    await this.commentOnce(itemId, `[legal-error:${episode}]`, message);
+    if (event.endsWith(':new')) {
+      // Webhook notifications ignore TAG. Persist the attempt before sending;
+      // an ambiguous transport failure must not create a notification every poll.
+      event = `${signature}:${episode}:notification-attempted`;
+      await this.lease.assert();
+      await this.api.updateItem(itemId, { [P + 'TECH_ERROR_KEY']: event });
+      const authorId = Number(item.createdBy);
+      for (const userId of new Set([1, authorId].filter(id => Number.isInteger(id) && id > 0))) {
+        await this.lease.assert();
+        await this.api.call('im.notify.system.add', { USER_ID: userId,
+          MESSAGE: `Ошибка автоматизации заявки №${itemId}: ${code}. [URL=https://myosminozhka.bitrix24.ru/rpa/item/57/${itemId}/]Открыть заявку[/URL]` });
+      }
+    }
+  }
+  async recover(itemId) {
+    const item = await this.api.getItem(itemId);
+    if (!item[P + 'TECH_ERROR_KEY'] && !item[P + 'TECH_ERROR']) return;
+    await this.commentOnce(itemId, `[legal-recovered:${sha(String(item[P + 'TECH_ERROR_KEY']))}]`, 'Обработка автоматизации восстановлена. Техническая ошибка снята.');
+    await this.lease.assert();
+    await this.api.updateItem(itemId, { [P + 'TECH_ERROR']: '', [P + 'TECH_ERROR_KEY']: '' });
+  }
+  async workflows(itemId) {
+    const identity = { MODULE_ID: 'rpa', ENTITY: 'Bitrix\\Rpa\\Integration\\Bizproc\\Document\\Item', DOCUMENT_ID: `${TYPE_ID}:${itemId}` };
+    const rows = []; let start = 0;
+    for (;;) {
+      const page = await this.api.call('bizproc.workflow.instances', {
+        SELECT: ['ID', ...Object.keys(identity)], FILTER: identity, ORDER: { ID: 'ASC' }, start });
+      if (!Array.isArray(page.result) || page.result.some(r => !r.ID || Object.entries(identity).some(([k, v]) => r[k] !== v))) throw new ArchiveError('WORKFLOW_OUTSIDE_ITEM');
+      rows.push(...page.result);
+      if (page.next === undefined) return rows;
+      if (Number(page.next) <= start) throw new ArchiveError('INVALID_PAGINATION');
+      start = Number(page.next);
+    }
+  }
+  async cancel(itemId, { dryRun = true } = {}) {
+    let item = await this.api.getItem(itemId);
+    if (Number(item.stageId) === 315) return { cancelled: false, reason: 'already_completed' };
+    const rows = await this.timeline(itemId);
+    const command = rows.filter(r => r.action === 'comment' && [1, Number(item.createdBy)].includes(Number(r.userId)) && /^\s*ОТМЕНИТЬ ЗАЯВКУ:\s*\S[\s\S]{2,999}\s*$/iu.test(String(r.textDescription ?? r.description)))
+      .sort((a, b) => Number(b.id) - Number(a.id))[0];
+    if (!command) return { cancelled: false, reason: 'no_authorized_command' };
+    if (String(item[P + 'CANCELLED_COMMAND_ID']) === String(command.id)) return { cancelled: Number(item.stageId) === 317, reason: 'command_already_processed' };
+    const workflows = await this.workflows(itemId);
+    const plan = { itemId, commandId: command.id, authorId: command.userId, workflowIds: workflows.map(w => w.ID), targetStageId: 317 };
+    if (dryRun) return { dryRun: true, ...plan };
+    // Freeze the exact request before touching active workflows. No approval
+    // task is completed to achieve cancellation, and no files are deleted.
+    const reason = String(command.textDescription ?? command.description).replace(/^\s*ОТМЕНИТЬ ЗАЯВКУ:\s*/iu, '').replace(/[<>\[\]]/g, '').trim();
+    await this.commentOnce(itemId, `[legal-cancel-request:${command.id}]`, `Принята отмена заявки по комментарию №${command.id}, автор ${command.userId}. Причина: ${reason}\nЗадания и напоминания останавливаются.`);
+    let pending = workflows;
+    for (let round = 0; pending.length && round < 3; round++) {
+      for (const w of pending) {
+        await this.lease.assert();
+        try { await this.api.call('bizproc.workflow.terminate', { ID: w.ID, STATUS: `Отмена RPA 57:${itemId}, комментарий ${command.id}` }); }
+        catch (e) {
+          // A successful termination may have lost its response. Reconcile only
+          // against this exact item's current instances, never kill blindly.
+          if ((await this.workflows(itemId)).some(current => current.ID === w.ID)) throw e;
+        }
+      }
+      pending = await this.workflows(itemId);
+    }
+    if (pending.length) throw new ArchiveError('CANCELLATION_STILL_RUNNING');
+    item = await this.api.getItem(itemId);
+    if (Number(item.stageId) === 315) throw new ArchiveError('CANCELLATION_COMPLETED_CONCURRENTLY');
+    await this.lease.assert();
+    if (Number(item.stageId) !== 317) await this.api.updateItem(itemId, { stageId: 317 });
+    if (Number((await this.api.getItem(itemId)).stageId) !== 317) throw new ArchiveError('CANCELLATION_NOT_VERIFIED');
+    if ((await this.workflows(itemId)).length) throw new ArchiveError('CANCELLATION_STILL_RUNNING');
+    await this.lease.assert();
+    await this.api.updateItem(itemId, { [P + 'CANCELLED_COMMAND_ID']: String(command.id) });
+    await this.commentOnce(itemId, `[legal-cancelled:${command.id}]`, `Заявка отменена по комментарию №${command.id}. Задания и напоминания остановлены. Карточка, причина отмены и архив документов сохранены.`);
+    return { cancelled: true, ...plan };
+  }
+}
+
 export function startLegalArchiveFromEnv(env = process.env, { logger = console.log, apiFactory = createArchiveApi } = {}) {
   if (env.LEGAL_ARCHIVE_ENABLED !== 'true') return { enabled: false, stop: async () => {} };
   const api = apiFactory(env.LEGAL_ARCHIVE_WEBHOOK_URL);
   const store = new DiskStore(api, env.LEGAL_ARCHIVE_FOLDER_ID);
   const lease = new DiskLease(store);
   const archiver = new LegalArchiver(api, store, lease);
+  const controls = new LegalProcessControls(api, lease);
+  const feedbackEnabled = env.LEGAL_PROCESS_FEEDBACK_ENABLED === 'true';
+  const cancellationEnabled = env.LEGAL_PROCESS_CANCELLATION_ENABLED === 'true';
   const allow = new Set((env.LEGAL_ARCHIVE_ALLOWED_ITEM_IDS || '').split(',').filter(Boolean));
   const pollMs = Math.max(30000, Number(env.LEGAL_ARCHIVE_POLL_MS || 60000));
   if (!Number.isFinite(pollMs) || [...allow].some(id => !/^\d+$/.test(id))) throw new ArchiveError('INVALID_ARCHIVE_CONFIG');
@@ -414,8 +530,18 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
       for (const item of page.result.items) {
         if (stopped) break;
         if (allow.size && !allow.has(String(item.id))) continue;
-        try { await archiver.process(item); processed++; }
-        catch (error) { log({ event: 'item_error', itemId: item.id, code: error instanceof ArchiveError ? error.code : 'UNEXPECTED_ERROR' }); }
+        try {
+          if (cancellationEnabled) await controls.cancel(item.id, { dryRun: false });
+          await archiver.process(await api.getItem(item.id));
+          if (feedbackEnabled) await controls.recover(item.id);
+          processed++;
+        } catch (error) {
+          log({ event: 'item_error', itemId: item.id, code: error instanceof ArchiveError ? error.code : 'UNEXPECTED_ERROR' });
+          if (feedbackEnabled) {
+            try { await controls.reportError(item.id, error); }
+            catch (reportError) { log({ event: 'feedback_error', itemId: item.id, code: reportError instanceof ArchiveError ? reportError.code : 'UNEXPECTED_ERROR' }); }
+          }
+        }
       }
       if (page.next === undefined) break;
       if (Number(page.next) <= start) throw new ArchiveError('INVALID_PAGINATION');
