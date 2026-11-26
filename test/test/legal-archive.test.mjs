@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ArchiveError, DiskStore, DiskLease, LegalArchiver, P, sha, stable,
-  startLegalArchiveFromEnv, startLegalArchiveSafely, validateFileUrl, createArchiveApi } from '../../src/src/legal-archive.mjs';
+  startLegalArchiveFromEnv, startLegalArchiveSafely, validateFileUrl, createArchiveApi, LegalHandoff, LegalRoleSummaries, handoffTarget } from '../../src/src/legal-archive.mjs';
 
 class MemoryBitrix {
   constructor() {
@@ -68,6 +68,87 @@ async function fixture() {
   return { api, source, store, lease, worker, process: () => worker.process(structuredClone(api.item)) };
 }
 const mutations = api => api.calls.filter(c => /upload|update|addSub|markDeleted/.test(c.method));
+
+async function transferFixture() {
+  const f=await fixture();
+  const controls={timeline:async()=>[],cancel:async()=>({cancelled:false})};
+  const summaries=new LegalRoleSummaries(f.api,f.lease,controls);
+  const handoff=new LegalHandoff(f.api,f.store,f.lease,f.worker,controls,summaries,{stageId:341});
+  f.api.item.stageId=341;f.api.item.previousStageId=313;f.api.item.movedTime='2026-11-26T19:00:00+03:00';f.api.item.movedBy=579;
+  return {...f,controls,summaries,handoff};
+}
+test('handoff stores immutable document and recipient summary before the next native task',async()=>{
+  const f=await transferFixture();
+  const result=await f.handoff.process(19);
+  assert.equal(result.target,321);assert.equal(f.api.item.stageId,321);
+  const receipt=[...f.api.disk.values()].find(x=>x.NAME.startsWith('handoff-'));
+  assert.ok(receipt);assert.ok(f.api.item[P+'VERSION_KEY']);
+  assert.equal((await f.store.readJson(receipt)).transferredBy,579);
+  const move=f.api.calls.findIndex(c=>c.method==='rpa.item.update'&&c.params.fields.stageId===321);
+  assert.ok(f.api.calls.slice(0,move).some(c=>c.method==='rpa.item.update'&&c.params.fields[P+'ROLE_SUMMARY']?.includes('Менеджер: согласие клиента')));
+  assert.equal(f.api.item[P+'HANDOFF_RECEIPT_KEY'],result.receipt);
+});
+test('two transfers before the periodic worker runs retain both original versions',async()=>{
+  const f=await transferFixture();await f.handoff.process(19);
+  const first=[...f.api.disk.values()].find(x=>x.NAME.startsWith('handoff-'));
+  const firstBytes=Buffer.from(f.api.data.get(first.ID));
+  const firstSource=f.source;
+  f.api.attach('LEGAL_PROJECT','Second lawyer version');
+  f.api.item.stageId=341;f.api.item.previousStageId=313;f.api.item.movedTime='2026-11-26T19:00:20+03:00';
+  await f.handoff.process(19);
+  const receipts=[...f.api.disk.values()].filter(x=>x.NAME.startsWith('handoff-'));
+  assert.equal(receipts.length,2);assert.deepEqual(f.api.data.get(first.ID),firstBytes);
+  assert.equal(f.api.item[P+'PROJECT_HISTORY'].length,2);
+  assert.ok((await f.store.readJson(first)).files.some(r=>r.sourceId===firstSource));
+});
+test('failed archive verification cannot hand off a document or create a ready receipt',async()=>{
+  const f=await transferFixture();f.api.corruptSnapshots=true;
+  await assert.rejects(f.handoff.process(19),/SNAPSHOT_COPY_NOT_VERIFIED/);
+  assert.equal(f.api.item.stageId,341);
+  assert.ok(![...f.api.disk.values()].some(x=>x.NAME.startsWith('handoff-')));
+});
+test('missing documents prevent the next participant from receiving a task',async()=>{
+  const f=await transferFixture();delete f.api.item[P+'LEGAL_PROJECT'];
+  await assert.rejects(f.handoff.process(19),/HANDOFF_REQUIRED_FILE_MISSING/);
+  assert.equal(f.api.item.stageId,341);
+});
+test('client approval cannot be carried to a different source version',async()=>{
+  const f=await transferFixture();await f.handoff.process(19);
+  f.api.attach('LEGAL_PROJECT','Unapproved edit');f.api.item[P+'CLIENT_PROOF']='Agreed on previous version';
+  f.api.item.stageId=341;f.api.item.previousStageId=321;f.api.item.movedTime='2026-11-26T19:02:00+03:00';
+  await assert.rejects(f.handoff.process(19),/HANDOFF_PROJECT_VERSION_CHANGED/);
+  assert.equal(f.api.item.stageId,341);assert.equal(f.api.item[P+'CLIENT_APPROVED_KEY'],'');
+});
+test('billing handoff requires both invoice and act and preserves both snapshots',async()=>{
+  const f=await transferFixture();delete f.api.item[P+'LEGAL_PROJECT'];
+  f.api.item[P+'DOCUMENT_TYPE']='2421';f.api.item.previousStageId=331;
+  f.api.attach('INVOICE_FILE','Invoice');
+  await assert.rejects(f.handoff.process(19),/HANDOFF_REQUIRED_FILE_MISSING/);
+  f.api.attach('ACT_FILE','Act');
+  assert.equal((await f.handoff.process(19)).target,333);
+  assert.ok(f.api.item[P+'SNAPSHOT_INVOICE']);assert.ok(f.api.item[P+'SNAPSHOT_ACT']);
+});
+test('cancellation during capture keeps the archive but prevents the next task',async()=>{
+  const f=await transferFixture();f.controls.cancel=async()=>{f.api.item.stageId=317;return {cancelled:true};};
+  assert.equal((await f.handoff.process(19)).cancelled,true);
+  assert.equal(f.api.item.stageId,317);assert.equal(f.api.item[P+'PROJECT_HISTORY'].length,1);
+  assert.ok(!f.api.calls.some(c=>c.method==='rpa.item.update'&&c.params.fields.stageId===321));
+});
+test('lost successful stage-change response reconciles without duplicate handoff',async()=>{
+  const f=await transferFixture();const update=f.api.updateItem.bind(f.api);
+  f.api.updateItem=async(id,fields)=>{await update(id,fields);if(fields.stageId===321)throw new ArchiveError('BITRIX_TRANSPORT_ERROR');};
+  assert.equal((await f.handoff.process(19)).transferred,true);
+  assert.equal((await f.handoff.process(19)).skipped,true);
+  assert.equal([...f.api.disk.values()].filter(x=>x.NAME.startsWith('handoff-')).length,1);
+});
+test('handoff routing keeps manager, head, Anna and GD decisions separate',()=>{
+  const base={ [P+'DOCUMENT_TYPE']:'2415',[P+'SIGNING_CHANNEL']:'2423'};
+  for(const[from,to]of [[313,321],[319,321],[321,323],[323,325],[325,327],[327,337],[337,339],[339,315]])assert.equal(handoffTarget({...base,previousStageId:from}),to);
+  const billing={...base,[P+'DOCUMENT_TYPE']:'2421'};
+  for(const[from,to]of [[329,331],[331,333],[333,335],[335,337],[337,315]])assert.equal(handoffTarget({...billing,previousStageId:from}),to);
+  assert.equal(handoffTarget({...billing,previousStageId:335,[P+'SIGNING_CHANNEL']:'2425'}),315);
+  assert.throws(()=>handoffTarget({...billing,previousStageId:313}),/INVALID_HANDOFF_ROUTE/);
+});
 
 test('disabled archive performs no calls and invalid config cannot stop the CRM service', () => {
   let calls = 0; const options = { apiFactory: () => { calls++; throw new ArchiveError('INVALID_CONFIG'); }, logger: () => {} };

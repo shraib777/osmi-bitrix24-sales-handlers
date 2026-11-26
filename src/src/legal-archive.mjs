@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { buildRoleSummary } from './legal-role-summary.mjs';
 
-// Only the development RPA is enabled. No AI, email, approval decisions,
-// or public archive endpoints. Cancellation is separately gated below.
+// Only the development RPA is enabled. No AI, email, automated approval
+// decisions, or public archive endpoints. Native human decisions remain native.
 export const TYPE_ID = 57;
 export const P = 'UF_RPA_57_';
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -363,9 +364,9 @@ export class LegalArchiver {
     spec.sources.forEach((s, i) => { fields[P + SOURCE_KEYS[s]] = String(refs[i][0].id); });
     await this.writeItem(item.id, fields);
   }
-  async process(item) {
+  async process(item, { checkpointSpec, force = false } = {}) {
     const last = this.observed.get(String(item.id));
-    if (last && last.key === observation(item) && Date.now() - last.at < 12 * 60 * 60 * 1000) return;
+    if (!force && last && last.key === observation(item) && Date.now() - last.at < 12 * 60 * 60 * 1000) return;
     await this.lease.assert();
     if (item.createdBy && !item[P + 'MANAGER_EMAIL']) {
       const users = (await this.api.call('user.get', { ID: item.createdBy })).result;
@@ -380,13 +381,120 @@ export class LegalArchiver {
     for (const slot of Object.keys(SOURCE_FIELDS)) for (const file of fileRefs(item[P + slot])) {
       records.set(`${slot}:${file.id}`, await this.history(item, slot, file, folder));
     }
-    const spec = checkpointFor(item);
+    const spec = checkpointSpec === undefined ? checkpointFor(item) : checkpointSpec;
     if (spec) await this.checkpoint(item, folder, spec, records);
     const after = await this.api.getItem(item.id);
     if (fingerprint(after) === fingerprint(item)) {
       if (this.observed.size >= 2000) this.observed.clear();
       this.observed.set(String(item.id), { key: observation(after), at: Date.now() });
     }
+    return { folder, records };
+  }
+}
+
+export function handoffTarget(item) {
+  const billing = ['2417', '2419', '2421'].includes(String(item[P + 'DOCUMENT_TYPE']));
+  const edo = String(item[P + 'SIGNING_CHANNEL']) === '2423';
+  const fixed = { 313:321, 319:321, 321:323, 323:325, 325:327, 329:331, 331:333, 333:335, 339:315 };
+  const from = Number(item.previousStageId);
+  const target = fixed[from] || (from === 327 ? (edo ? 337 : 339) : from === 335 ? (edo ? 337 : 315) : from === 337 ? (billing ? 315 : 339) : null);
+  if (!target || (billing && [313,319,321,323,325,327,339].includes(from)) || (!billing && [329,331,333,335].includes(from))) throw new ArchiveError('INVALID_HANDOFF_ROUTE');
+  return target;
+}
+const transferInput = item => sha(stable({ context:businessContext(item), sources:sourceIds(item), contractEmail:item[P+'CONTRACT_EMAIL']||'', clientProof:item[P+'CLIENT_PROOF']||'' }));
+function transferSpec(item) {
+  const from = Number(item.previousStageId);
+  if ([313,319].includes(from)) return CHECKPOINTS[321];
+  if (from === 325) return CHECKPOINTS[327];
+  if (from === 331) return checkpointFor({ ...item, stageId:333 });
+  return null;
+}
+function requireFiles(item, slots) {
+  if (slots.some(slot => !fileRefs(item[P+slot]).length)) throw new ArchiveError('HANDOFF_REQUIRED_FILE_MISSING');
+}
+function validateTransfer(item) {
+  const from = Number(item.previousStageId);
+  const spec = transferSpec(item);
+  if (spec) requireFiles(item,spec.sources);
+  if (from === 339) requireFiles(item,['FINAL_FILES']);
+  if ([321,323].includes(from)) {
+    requireFiles(item,['LEGAL_PROJECT','CLIENT_DOCUMENT']);
+    const key = sha(stable({ sources:[String(fileRefs(item[P+'LEGAL_PROJECT'])[0].id)], context:businessContext(item) }));
+    if (item[P+'VERSION_KEY'] !== key || String(item[P+'PROJECT_SOURCE_ID']) !== String(fileRefs(item[P+'LEGAL_PROJECT'])[0].id)) throw new ArchiveError('HANDOFF_PROJECT_VERSION_CHANGED');
+    if (!String(item[P+'CLIENT_PROOF']||'').trim()) throw new ArchiveError('HANDOFF_CLIENT_APPROVAL_MISSING');
+    if (from === 323 && item[P+'CLIENT_APPROVED_KEY'] !== key) throw new ArchiveError('HANDOFF_CLIENT_APPROVAL_MISSING');
+  }
+  if ([327,333,335,337,339].includes(from)) {
+    const slots = [327,339].includes(from) || (from===337 && !['2417','2419','2421'].includes(String(item[P+'DOCUMENT_TYPE']))) ? ['CONTRACT_PACKAGE'] : checkpointFor({ ...item, stageId:333 })?.sources;
+    if (!slots) throw new ArchiveError('INVALID_HANDOFF_ROUTE');
+    requireFiles(item,slots);
+    const key=sha(stable({ sources:slots.map(s=>String(fileRefs(item[P+s])[0].id)), context:businessContext(item) }));
+    if (item[P+'PACKAGE_VERSION_KEY']!==key) throw new ArchiveError('HANDOFF_PACKAGE_VERSION_CHANGED');
+    if ([335,337,339].includes(from) && item[P+'PACKAGE_APPROVED_KEY']!==key) throw new ArchiveError('HANDOFF_MANAGER_APPROVAL_MISSING');
+  }
+}
+
+export class LegalRoleSummaries {
+  constructor(api,lease,controls) { this.api=api; this.lease=lease; this.controls=controls; }
+  async update(itemId, {stageId}={}) {
+    const item=await this.api.getItem(itemId);
+    const timeline=await this.controls.timeline(itemId);
+    const result=buildRoleSummary(item,{stageId:stageId??Number(item.stageId),timeline});
+    const key=sha(result.text);
+    if(item[P+'ROLE_SUMMARY_KEY']!==key || item[P+'ROLE_SUMMARY']!==result.text) {
+      await this.lease.assert();
+      const current=await this.api.getItem(itemId);
+      if(fingerprint(current)!==fingerprint(item))throw new ArchiveError('ITEM_CHANGED_DURING_CAPTURE');
+      await this.api.updateItem(itemId,{[P+'ROLE_SUMMARY']:result.text,[P+'ROLE_SUMMARY_KEY']:key});
+    }
+    return result;
+  }
+}
+
+// Human approval remains in native RPA tasks. Their successful action enters
+// this automatic stage; the next human task is created only after verified
+// archival, an immutable transfer receipt, and the recipient's summary exist.
+export class LegalHandoff {
+  constructor(api,store,lease,archiver,controls,summaries,{stageId}={}) {
+    if(!Number.isInteger(stageId)||stageId<1)throw new ArchiveError('INVALID_HANDOFF_STAGE');
+    Object.assign(this,{api,store,lease,archiver,controls,summaries,stageId});
+  }
+  async process(itemId) {
+    let item=await this.api.getItem(itemId);
+    if(Number(item.stageId)!==this.stageId)return {skipped:true};
+    const target=handoffTarget(item), from=Number(item.previousStageId), input=transferInput(item);
+    const moved=String(item.movedTime||'');
+    if(!moved)throw new ArchiveError('HANDOFF_TIME_MISSING');
+    validateTransfer(item);
+    const record=await this.archiver.process(item,{checkpointSpec:transferSpec(item),force:true});
+    let current=await this.api.getItem(itemId);
+    if(Number(current.stageId)!==this.stageId || Number(current.previousStageId)!==from || String(current.movedTime)!==moved || transferInput(current)!==input)throw new ArchiveError('ITEM_CHANGED_DURING_CAPTURE');
+    const fields={};
+    if(from===321)fields[P+'CLIENT_APPROVED_KEY']=current[P+'VERSION_KEY'];
+    if(from===323)fields[P+'HEAD_APPROVED_KEY']=current[P+'VERSION_KEY'];
+    if([327,333].includes(from))fields[P+'PACKAGE_APPROVED_KEY']=current[P+'PACKAGE_VERSION_KEY'];
+    if(Object.keys(fields).length){await this.lease.assert();await this.api.updateItem(itemId,fields);}
+    const folder=record?.folder||await this.store.folder(itemId);
+    const id=sha(stable({itemId:String(itemId),from,target,moved,input}));
+    const receipt={schema:1,typeId:TYPE_ID,itemId:String(itemId),from,target,transferredBy:Number(item.movedBy)||null,requestedAt:moved,input,
+      files:[...(record?.records?.values()||[])].map(r=>({slot:r.slot,sourceId:r.sourceId,sha256:r.sha256,blobId:r.blobId})).sort((a,b)=>`${a.slot}:${a.sourceId}`.localeCompare(`${b.slot}:${b.sourceId}`))};
+    await this.lease.assert();
+    await this.store.putJson(folder,`handoff-${id}.json`,receipt);
+    if(current[P+'TECH_ERROR']&&this.controls.recover)await this.controls.recover(itemId);
+    await this.summaries.update(itemId,{stageId:target});
+    // Cancellation and concurrent edits must be checked again after I/O.
+    await this.controls.cancel(itemId,{dryRun:false});
+    current=await this.api.getItem(itemId);
+    if(Number(current.stageId)===317)return {cancelled:true};
+    if(Number(current.stageId)!==this.stageId || Number(current.previousStageId)!==from || String(current.movedTime)!==moved || transferInput(current)!==input)throw new ArchiveError('ITEM_CHANGED_DURING_CAPTURE');
+    await this.lease.assert();
+    await this.api.updateItem(itemId,{[P+'HANDOFF_RECEIPT_KEY']:id,[P+'TECH_ERROR']:'',[P+'TECH_ERROR_KEY']:''});
+    await this.lease.assert();
+    try { await this.api.updateItem(itemId,{stageId:target}); }
+    catch(error) { if(Number((await this.api.getItem(itemId)).stageId)!==target)throw error; }
+    const after=await this.api.getItem(itemId);
+    if(Number(after.stageId)===this.stageId)throw new ArchiveError('HANDOFF_STAGE_NOT_CHANGED');
+    return {transferred:true,from,target,receipt:id,files:receipt.files.length};
   }
 }
 
@@ -516,16 +624,31 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
   const controls = new LegalProcessControls(api, lease);
   const feedbackEnabled = env.LEGAL_PROCESS_FEEDBACK_ENABLED === 'true';
   const cancellationEnabled = env.LEGAL_PROCESS_CANCELLATION_ENABLED === 'true';
+  const summariesEnabled = env.LEGAL_ROLE_SUMMARIES_ENABLED === 'true';
+  const handoffEnabled = env.LEGAL_HANDOFF_ENABLED === 'true';
+  const summaries = new LegalRoleSummaries(api,lease,controls);
+  const handoff = handoffEnabled ? new LegalHandoff(api,store,lease,archiver,controls,summaries,{stageId:Number(env.LEGAL_HANDOFF_STAGE_ID)}) : null;
+  if(handoffEnabled&&!cancellationEnabled)throw new ArchiveError('HANDOFF_REQUIRES_CANCELLATION');
   const allow = new Set((env.LEGAL_ARCHIVE_ALLOWED_ITEM_IDS || '').split(',').filter(Boolean));
   const pollMs = Math.max(30000, Number(env.LEGAL_ARCHIVE_POLL_MS || 60000));
   if (!Number.isFinite(pollMs) || [...allow].some(id => !/^\d+$/.test(id))) throw new ArchiveError('INVALID_ARCHIVE_CONFIG');
-  let stopped = false, timer, running;
+  const handoffPollMs=Math.max(5000,Number(env.LEGAL_HANDOFF_POLL_MS||5000));
+  if(!Number.isFinite(handoffPollMs))throw new ArchiveError('INVALID_HANDOFF_POLL');
+  let stopped = false, timer, running, priorityTimer, priorityRunning, verified=false;
+  const locks=new Map();
+  const locked=async(id,fn)=>{const key=String(id),next=(locks.get(key)||Promise.resolve()).catch(()=>{}).then(fn);locks.set(key,next);try{return await next;}finally{if(locks.get(key)===next)locks.delete(key);}};
   const log = fields => logger(JSON.stringify({ ...fields, component: 'legal_archive', aiEnabled: false }));
+  const report=async(itemId,error)=>{
+    log({event:'item_error',itemId,code:error instanceof ArchiveError?error.code:'UNEXPECTED_ERROR'});
+    if(feedbackEnabled){try{await controls.reportError(itemId,error);}catch(e){log({event:'feedback_error',itemId,code:e instanceof ArchiveError?e.code:'UNEXPECTED_ERROR'});}}
+  };
   const once = async () => {
     const type = (await api.call('rpa.type.get', { id: TYPE_ID })).result.type;
     if (type.title !== 'Юридические документы — разработка') throw new ArchiveError('UNEXPECTED_RPA_TYPE');
     const root = (await api.call('disk.folder.get', { id: store.root })).result;
     if (root.NAME !== 'OSMI Legal RPA 57 - development archive' || String(root.STORAGE_ID) !== '1' || String(root.PARENT_ID) !== '1' || !active(root)) throw new ArchiveError('UNEXPECTED_ARCHIVE_FOLDER');
+    if(handoffEnabled){const stage=(await api.call('rpa.stage.get',{id:handoff.stageId})).result.stage;if(Number(stage.typeId)!==TYPE_ID||stage.code!=='archive_handoff')throw new ArchiveError('UNEXPECTED_HANDOFF_STAGE');}
+    verified=true;
     if (!await lease.acquire()) { log({ event: 'lease_busy' }); return; }
     let start = 0, processed = 0;
     for (;;) {
@@ -535,16 +658,17 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
         if (stopped) break;
         if (allow.size && !allow.has(String(item.id))) continue;
         try {
-          if (cancellationEnabled) await controls.cancel(item.id, { dryRun: false });
-          await archiver.process(await api.getItem(item.id));
-          if (feedbackEnabled) await controls.recover(item.id);
+          await locked(item.id,async()=>{
+            if (cancellationEnabled) await controls.cancel(item.id, { dryRun: false });
+            const current=await api.getItem(item.id);
+            if(handoff && Number(current.stageId)===handoff.stageId)return;
+            await archiver.process(current);
+            if (feedbackEnabled) await controls.recover(item.id);
+            if(summariesEnabled && ![315,317].includes(Number(current.stageId)))await summaries.update(item.id);
+          });
           processed++;
         } catch (error) {
-          log({ event: 'item_error', itemId: item.id, code: error instanceof ArchiveError ? error.code : 'UNEXPECTED_ERROR' });
-          if (feedbackEnabled) {
-            try { await controls.reportError(item.id, error); }
-            catch (reportError) { log({ event: 'feedback_error', itemId: item.id, code: reportError instanceof ArchiveError ? reportError.code : 'UNEXPECTED_ERROR' }); }
-          }
+          await report(item.id,error);
         }
       }
       if (page.next === undefined) break;
@@ -553,15 +677,44 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
     }
     log({ event: 'poll_complete', processed });
   };
+  const priority=async()=>{
+    if(!verified||!await lease.acquire())return;
+    let start=0;
+    for(;;){
+      const activeStages=[309,311,313,319,321,323,325,327,329,331,333,335,337,339,handoff.stageId];
+      const page=await api.call('rpa.item.list',{typeId:TYPE_ID,filter:{stageId:summariesEnabled?activeStages:handoff.stageId},start,order:{id:'ASC'}});
+      if(!Array.isArray(page.result?.items))throw new ArchiveError('INVALID_HANDOFF_LIST');
+      const prioritized=[...page.result.items].sort((a,b)=>(Number(b.stageId)===handoff.stageId)-(Number(a.stageId)===handoff.stageId));
+      for(const item of prioritized){
+        if(stopped)break;
+        // Never rely on a server-side filter alone before a mutation.
+        if(!activeStages.includes(Number(item.stageId)))continue;
+        if(allow.size&&!allow.has(String(item.id)))continue;
+        try{
+          if(Number(item.stageId)===handoff.stageId){const result=await locked(item.id,()=>handoff.process(item.id));if(result.transferred)log({event:'handoff_complete',itemId:item.id,from:result.from,target:result.target,files:result.files});}
+          else if(summariesEnabled&&!String(item[P+'ROLE_SUMMARY']||'').startsWith(buildRoleSummary(item).text.split('\n')[0]+'\n'))await locked(item.id,()=>summaries.update(item.id));
+        }
+        catch(error){await report(item.id,error);}
+      }
+      if(stopped||page.next===undefined)break;
+      if(Number(page.next)<=start)throw new ArchiveError('INVALID_PAGINATION');start=Number(page.next);
+    }
+  };
+  const priorityTick=()=>{
+    if(stopped)return;
+    priorityRunning=priority().catch(e=>log({event:'handoff_poll_error',code:e instanceof ArchiveError?e.code:'UNEXPECTED_ERROR'}))
+      .finally(()=>{if(!stopped){priorityTimer=setTimeout(priorityTick,handoffPollMs);priorityTimer.unref?.();}});
+  };
   const tick = () => {
     if (stopped) return;
     running = once().catch(error => log({ event: 'poll_error', code: error instanceof ArchiveError ? error.code : 'UNEXPECTED_ERROR' }))
       .finally(() => { if (!stopped) { timer = setTimeout(tick, pollMs); timer.unref?.(); } });
   };
   timer = setTimeout(tick, 1000); timer.unref?.();
+  if(handoff){priorityTimer=setTimeout(priorityTick,2000);priorityTimer.unref?.();}
   return { enabled: true, async stop() {
-    stopped = true; clearTimeout(timer);
-    await running;
+    stopped = true; clearTimeout(timer);clearTimeout(priorityTimer);
+    await Promise.allSettled([running,priorityRunning]);
     await lease.release().catch(() => {});
   } };
 }
