@@ -481,7 +481,7 @@ export class LegalHandoff {
     await this.lease.assert();
     await this.store.putJson(folder,`handoff-${id}.json`,receipt);
     if(current[P+'TECH_ERROR']&&this.controls.recover)await this.controls.recover(itemId);
-    await this.summaries.update(itemId,{stageId:target});
+    if(this.summaries)await this.summaries.update(itemId,{stageId:target});
     // Cancellation and concurrent edits must be checked again after I/O.
     await this.controls.cancel(itemId,{dryRun:false});
     current=await this.api.getItem(itemId);
@@ -626,7 +626,7 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
   const cancellationEnabled = env.LEGAL_PROCESS_CANCELLATION_ENABLED === 'true';
   const summariesEnabled = env.LEGAL_ROLE_SUMMARIES_ENABLED === 'true';
   const handoffEnabled = env.LEGAL_HANDOFF_ENABLED === 'true';
-  const summaries = new LegalRoleSummaries(api,lease,controls);
+  const summaries = summariesEnabled ? new LegalRoleSummaries(api,lease,controls) : null;
   const handoff = handoffEnabled ? new LegalHandoff(api,store,lease,archiver,controls,summaries,{stageId:Number(env.LEGAL_HANDOFF_STAGE_ID)}) : null;
   if(handoffEnabled&&!cancellationEnabled)throw new ArchiveError('HANDOFF_REQUIRES_CANCELLATION');
   const allow = new Set((env.LEGAL_ARCHIVE_ALLOWED_ITEM_IDS || '').split(',').filter(Boolean));
