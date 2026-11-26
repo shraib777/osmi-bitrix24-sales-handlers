@@ -112,6 +112,16 @@ test('unrelated workflow from a bad filter is never terminated', async () => {
   await assert.rejects(a.controls.cancel(19, { dryRun: false }), /WORKFLOW_OUTSIDE_ITEM/);
   assert.equal(writes(a).length, 0);
 });
+test('portal double-escaped ENTITY is accepted only for the exact RPA item', async () => {
+  const a = new ControlApi(); a.command(); a.workflow();
+  a.workflows[0].ENTITY = a.workflows[0].ENTITY.replaceAll('\\', '\\\\');
+  assert.equal((await a.controls.cancel(19, { dryRun: false })).cancelled, true);
+  const request = a.calls.find(c => c.method === 'bizproc.workflow.instances').params;
+  assert.deepEqual(request.FILTER, { MODULE_ID: 'rpa', DOCUMENT_ID: '57:19' });
+  const b = new ControlApi(); b.command(); b.workflow(); b.workflows[0].ENTITY = 'AnotherClass';
+  await assert.rejects(b.controls.cancel(19, { dryRun: false }), /WORKFLOW_OUTSIDE_ITEM/);
+  assert.equal(writes(b).length, 0);
+});
 test('lost termination response is reconciled against the exact item', async () => {
   const a = new ControlApi(); a.command(); a.workflow(); a.failTerminateAfter = true;
   assert.equal((await a.controls.cancel(19, { dryRun: false })).cancelled, true);
