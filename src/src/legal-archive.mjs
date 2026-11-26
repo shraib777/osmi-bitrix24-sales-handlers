@@ -453,8 +453,12 @@ export class LegalProcessControls {
     const rows = []; let start = 0;
     for (;;) {
       const page = await this.api.call('bizproc.workflow.instances', {
-        SELECT: ['ID', ...Object.keys(identity)], FILTER: identity, ORDER: { ID: 'ASC' }, start });
-      if (!Array.isArray(page.result) || page.result.some(r => !r.ID || Object.entries(identity).some(([k, v]) => r[k] !== v))) throw new ArchiveError('WORKFLOW_OUTSIDE_ITEM');
+        // This portal returns ENTITY with doubled backslashes, and filtering
+        // on the canonical single-backslash value silently returns no rows.
+        // Filter by module/document, then verify the class on every result.
+        SELECT: ['ID', ...Object.keys(identity)], FILTER: { MODULE_ID: identity.MODULE_ID, DOCUMENT_ID: identity.DOCUMENT_ID }, ORDER: { ID: 'ASC' }, start });
+      if (!Array.isArray(page.result) || page.result.some(r => !r.ID || r.MODULE_ID !== identity.MODULE_ID || r.DOCUMENT_ID !== identity.DOCUMENT_ID ||
+          String(r.ENTITY).replace(/\\+/g, '\\') !== identity.ENTITY)) throw new ArchiveError('WORKFLOW_OUTSIDE_ITEM');
       rows.push(...page.result);
       if (page.next === undefined) return rows;
       if (Number(page.next) <= start) throw new ArchiveError('INVALID_PAGINATION');
