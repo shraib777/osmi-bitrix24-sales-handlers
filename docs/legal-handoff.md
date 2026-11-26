@@ -2,7 +2,7 @@
 
 The worker is restricted to the development process `Юридические документы — разработка` (RPA 57). AI generation and automatic email remain disabled. Native tasks retain all human approval decisions.
 
-Successful native task actions enter the automatic stage `archive_handoff` (341). A priority worker captures original files and verified approval copies, writes an immutable receipt to the existing Bitrix Disk archive, prepares the next role's summary, then moves to the existing destination. It never completes an approval task on behalf of a person. Rejection and factual clarification routes remain native.
+Successful native task actions enter the automatic stage `archive_handoff` (341). A priority worker captures original files and verified approval copies, writes an immutable receipt to the existing Bitrix Disk archive, prepares the next role's summary when enabled, then moves to the existing destination. It never completes an approval task on behalf of a person. Rejection and factual clarification routes remain native.
 
 The next participant receives a task only after archival succeeds. While capture is pending the request remains on the automatic stage. Failures appear in the BP and are retried. Cancellation is checked again after capture. A timed-out successful move is reconciled by reading the item's stage instead of blindly replaying the business action.
 
@@ -28,3 +28,5 @@ Before enabling, verify the stage code and type, preserve actual actors (manager
 AI/lawyer pair preservation remains a requirement of the future AI integration: the AI output must be archived before assigning lawyer review, and its generation ID must be carried to the corrected version. This update does not activate AI or fabricate a training pair from unrelated historical files.
 
 Rollback must restore native successful action destinations together with disabling the handoff flag. Do not disable the processor while requests are still waiting on 341. Original routes and UI change evidence are retained in the local development project's `implementation/evidence/handoff-native-edit-result.json`.
+
+On 2026-11-26 the user cancelled role summaries. The current deployment sets `LEGAL_ROLE_SUMMARIES_ENABLED=false` and hides the summary field in native tasks. `LEGAL_HANDOFF_ENABLED=true` remains active: capture, immutable receipts and handoff do not require summaries.

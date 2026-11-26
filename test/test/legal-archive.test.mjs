@@ -88,6 +88,15 @@ test('handoff stores immutable document and recipient summary before the next na
   assert.ok(f.api.calls.slice(0,move).some(c=>c.method==='rpa.item.update'&&c.params.fields[P+'ROLE_SUMMARY']?.includes('Менеджер: согласие клиента')));
   assert.equal(f.api.item[P+'HANDOFF_RECEIPT_KEY'],result.receipt);
 });
+test('disabling role summaries retains archive-before-handoff without summary writes',async()=>{
+  const f=await transferFixture();f.handoff.summaries=null;
+  const result=await f.handoff.process(19);
+  assert.equal(result.transferred,true);assert.equal(f.api.item.stageId,321);
+  assert.ok(f.api.item[P+'VERSION_KEY']);assert.ok(f.api.item[P+'HANDOFF_RECEIPT_KEY']);
+  assert.equal(f.api.item[P+'PROJECT_HISTORY'].length,1);
+  assert.ok(!f.api.calls.some(c=>c.method==='rpa.item.update'&&Object.keys(c.params.fields).some(k=>k.includes('ROLE_SUMMARY'))));
+  assert.ok([...f.api.disk.values()].some(x=>x.NAME.startsWith('handoff-')));
+});
 test('two transfers before the periodic worker runs retain both original versions',async()=>{
   const f=await transferFixture();await f.handoff.process(19);
   const first=[...f.api.disk.values()].find(x=>x.NAME.startsWith('handoff-'));
