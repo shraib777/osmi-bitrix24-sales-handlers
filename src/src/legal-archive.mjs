@@ -616,6 +616,12 @@ export class LegalProcessControls {
   }
 }
 
+export function buildBillingActionUrl(item,code){
+ if(!/^local\.[a-zA-Z0-9._-]+$/.test(code||'')||!/^\d+$/.test(String(item.id)))return '';
+ const key=item[P+'VERSION_KEY'];const ready=[2403,2405,2407,2409,2411,2415].includes(Number(item[P+'DOCUMENT_TYPE']))&&[325,327,337,339,315].includes(Number(item.stageId))&&key&&item[P+'HEAD_APPROVED_KEY']===key&&item[P+'CLIENT_APPROVED_KEY']===key;
+ return ready?`https://myosminozhka.bitrix24.ru/marketplace/view/${code}/?params[sourceId]=${item.id}`:'';
+}
+
 export function startLegalArchiveFromEnv(env = process.env, { logger = console.log, apiFactory = createArchiveApi } = {}) {
   if (env.LEGAL_ARCHIVE_ENABLED !== 'true') return { enabled: false, stop: async () => {} };
   const api = apiFactory(env.LEGAL_ARCHIVE_WEBHOOK_URL);
@@ -631,7 +637,7 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
   if(reviewEnabled&&(!cancellationEnabled||!Number.isInteger(review.stageId)||review.stageId<1))throw new ArchiveError('INVALID_CLIENT_REVIEW_CONFIG');
   const billingCode=env.LEGAL_BILLING_APP_ENABLED==='true'?env.LEGAL_BILLING_APP_CODE:'';
   if(billingCode&&!/^local\.[a-zA-Z0-9._-]+$/.test(billingCode))throw new ArchiveError('INVALID_BILLING_APP_CODE');
-  const billingLink=async item=>{if(!billingCode)return;const key=item[P+'VERSION_KEY'];const ready=[2403,2405,2407,2409,2411,2415].includes(Number(item[P+'DOCUMENT_TYPE']))&&[325,327,337,339,315].includes(Number(item.stageId))&&key&&item[P+'HEAD_APPROVED_KEY']===key&&item[P+'CLIENT_APPROVED_KEY']===key;const url=ready?`https://myosminozhka.bitrix24.ru/marketplace/view/${billingCode}/?params[sourceId]=${item.id}`:'';if((item[P+'BILLING_ACTION_URL']||'')!==url){await lease.assert();await api.updateItem(item.id,{[P+'BILLING_ACTION_URL']:url});}};
+  const billingLink=async item=>{if(!billingCode)return;const url=buildBillingActionUrl(item,billingCode);if((item[P+'BILLING_ACTION_URL']||'')!==url){await lease.assert();await api.updateItem(item.id,{[P+'BILLING_ACTION_URL']:url});}};
   const handoffEnabled = env.LEGAL_HANDOFF_ENABLED === 'true';
   const summaries = summariesEnabled ? new LegalRoleSummaries(api,lease,controls) : null;
   const handoff = handoffEnabled ? new LegalHandoff(api,store,lease,archiver,controls,summaries,{stageId:Number(env.LEGAL_HANDOFF_STAGE_ID)}) : null;
@@ -690,8 +696,9 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
     if(!verified||!await lease.acquire())return;
     let start=0;
     for(;;){
-      const activeStages=[309,311,313,319,321,323,325,327,329,331,333,335,337,339,...[handoff?.stageId,review?.stageId].filter(Boolean)];
-      const page=await api.call('rpa.item.list',{typeId:TYPE_ID,filter:{stageId:summariesEnabled?activeStages:[handoff?.stageId,review?.stageId].filter(Boolean)},start,order:{id:'ASC'}});
+      const activeStages=[309,311,313,319,321,323,325,327,329,331,333,335,337,339,...(billingCode?[315]:[]),...[handoff?.stageId,review?.stageId].filter(Boolean)];
+      const priorityStages=summariesEnabled?activeStages:[...new Set([handoff?.stageId,review?.stageId,...(billingCode?[325,327,337,339,315]:[])].filter(Boolean))];
+      const page=await api.call('rpa.item.list',{typeId:TYPE_ID,filter:{stageId:priorityStages},start,order:{id:'ASC'}});
       if(!Array.isArray(page.result?.items))throw new ArchiveError('INVALID_HANDOFF_LIST');
       const prioritized=[...page.result.items].sort((a,b)=>(Number(b.stageId)===handoff?.stageId)-(Number(a.stageId)===handoff?.stageId));
       for(const item of prioritized){
@@ -701,8 +708,9 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
         if(allow.size&&!allow.has(String(item.id)))continue;
         try{
           if(review&&Number(item.stageId)===review.stageId){const result=await locked(item.id,()=>review.process(item.id));if(result.transferred)log({event:'client_review_complete',itemId:item.id,target:result.target,manual:result.manual,changes:result.changes});}
-          else if(handoff&&Number(item.stageId)===handoff.stageId){const result=await locked(item.id,()=>handoff.process(item.id));if(result.transferred)log({event:'handoff_complete',itemId:item.id,from:result.from,target:result.target,files:result.files});}
-          else if(summariesEnabled&&!String(item[P+'ROLE_SUMMARY']||'').startsWith(buildRoleSummary(item).text.split('\n')[0]+'\n'))await locked(item.id,()=>summaries.update(item.id));
+          else if(handoff&&Number(item.stageId)===handoff.stageId){const result=await locked(item.id,()=>handoff.process(item.id));if(result.transferred){await billingLink(await api.getItem(item.id));log({event:'handoff_complete',itemId:item.id,from:result.from,target:result.target,files:result.files});}}
+          else if(billingCode)await locked(item.id,()=>billingLink(item));
+          if(summariesEnabled&&!String(item[P+'ROLE_SUMMARY']||'').startsWith(buildRoleSummary(item).text.split('\n')[0]+'\n'))await locked(item.id,()=>summaries.update(item.id));
         }
         catch(error){await report(item.id,error);}
       }
