@@ -1,0 +1,6 @@
+import test from'node:test';import assert from'node:assert/strict';import vm from'node:vm';import fs from'node:fs/promises';
+const source=await fs.readFile(new URL('../../src/src/billing-app/install.mjs',import.meta.url),'utf8');
+async function run(handlers,error){const calls=[],status={};let finished=0,done;const BX24={init:f=>{done=f();},getDomain:()=> 'myosminozhka.bitrix24.ru',isAdmin:()=>true,callMethod:(method,p,cb)=>{calls.push(method);cb({error:()=>error||null,data:()=>method==='placement.get'?handlers:true});},installFinish:()=>finished++};vm.runInNewContext(source,{BX24,document:{querySelector:()=>status}});await done;return{calls,status,finished};}
+test('local app reinstall verifies an existing placement and finishes idempotently',async()=>{const r=await run([{placement:'REST_APP_URI',handler:'https://osmi-bitrix24-sales-handlers.onrender.com/legal/billing'}]);assert.deepEqual(r.calls,['placement.get']);assert.equal(r.finished,1);});
+test('first install registers missing placement before finishing',async()=>{const r=await run([]);assert.deepEqual(r.calls,['placement.get','placement.bind']);assert.equal(r.finished,1);});
+test('failed placement lookup exposes a safe error code and never finishes installation',async()=>{const r=await run([],'ACCESS_DENIED');assert.equal(r.finished,0);assert.match(r.status.textContent,/ACCESS_DENIED/);});
