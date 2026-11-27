@@ -9,7 +9,10 @@
     "test": "node --test"
   },
   "dependencies": {
+    "diff": "9.0.0",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "jszip": "3.10.2",
+    "xml-js": "1.6.11"
   }
 }

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { LegalClientReview, ClientReviewError } from './legal-client-review.mjs';
 import { buildRoleSummary } from './legal-role-summary.mjs';
 
 // Only the development RPA is enabled. No AI, email, automated approval
@@ -625,6 +626,12 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
   const feedbackEnabled = env.LEGAL_PROCESS_FEEDBACK_ENABLED === 'true';
   const cancellationEnabled = env.LEGAL_PROCESS_CANCELLATION_ENABLED === 'true';
   const summariesEnabled = env.LEGAL_ROLE_SUMMARIES_ENABLED === 'true';
+  const reviewEnabled = env.LEGAL_CLIENT_REVIEW_ENABLED === 'true';
+  const review = reviewEnabled ? new LegalClientReview(api,store,lease,controls,{stageId:Number(env.LEGAL_CLIENT_REVIEW_STAGE_ID)}) : null;
+  if(reviewEnabled&&(!cancellationEnabled||!Number.isInteger(review.stageId)||review.stageId<1))throw new ArchiveError('INVALID_CLIENT_REVIEW_CONFIG');
+  const billingCode=env.LEGAL_BILLING_APP_ENABLED==='true'?env.LEGAL_BILLING_APP_CODE:'';
+  if(billingCode&&!/^local\.[a-zA-Z0-9._-]+$/.test(billingCode))throw new ArchiveError('INVALID_BILLING_APP_CODE');
+  const billingLink=async item=>{if(!billingCode)return;const key=item[P+'VERSION_KEY'];const ready=[2403,2405,2407,2409,2411,2415].includes(Number(item[P+'DOCUMENT_TYPE']))&&[325,327,337,339,315].includes(Number(item.stageId))&&key&&item[P+'HEAD_APPROVED_KEY']===key&&item[P+'CLIENT_APPROVED_KEY']===key;const url=ready?`https://myosminozhka.bitrix24.ru/marketplace/view/${billingCode}/?params[sourceId]=${item.id}`:'';if((item[P+'BILLING_ACTION_URL']||'')!==url){await lease.assert();await api.updateItem(item.id,{[P+'BILLING_ACTION_URL']:url});}};
   const handoffEnabled = env.LEGAL_HANDOFF_ENABLED === 'true';
   const summaries = summariesEnabled ? new LegalRoleSummaries(api,lease,controls) : null;
   const handoff = handoffEnabled ? new LegalHandoff(api,store,lease,archiver,controls,summaries,{stageId:Number(env.LEGAL_HANDOFF_STAGE_ID)}) : null;
@@ -639,8 +646,8 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
   const locked=async(id,fn)=>{const key=String(id),next=(locks.get(key)||Promise.resolve()).catch(()=>{}).then(fn);locks.set(key,next);try{return await next;}finally{if(locks.get(key)===next)locks.delete(key);}};
   const log = fields => logger(JSON.stringify({ ...fields, component: 'legal_archive', aiEnabled: false }));
   const report=async(itemId,error)=>{
-    log({event:'item_error',itemId,code:error instanceof ArchiveError?error.code:'UNEXPECTED_ERROR'});
-    if(feedbackEnabled){try{await controls.reportError(itemId,error);}catch(e){log({event:'feedback_error',itemId,code:e instanceof ArchiveError?e.code:'UNEXPECTED_ERROR'});}}
+    log({event:'item_error',itemId,code:error instanceof ArchiveError||error instanceof ClientReviewError?error.code:'UNEXPECTED_ERROR'});
+    if(feedbackEnabled){try{await controls.reportError(itemId,error instanceof ClientReviewError?new ArchiveError(error.code):error);}catch(e){log({event:'feedback_error',itemId,code:e instanceof ArchiveError?e.code:'UNEXPECTED_ERROR'});}}
   };
   const once = async () => {
     const type = (await api.call('rpa.type.get', { id: TYPE_ID })).result.type;
@@ -648,6 +655,7 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
     const root = (await api.call('disk.folder.get', { id: store.root })).result;
     if (root.NAME !== 'OSMI Legal RPA 57 - development archive' || String(root.STORAGE_ID) !== '1' || String(root.PARENT_ID) !== '1' || !active(root)) throw new ArchiveError('UNEXPECTED_ARCHIVE_FOLDER');
     if(handoffEnabled){const stage=(await api.call('rpa.stage.get',{id:handoff.stageId})).result.stage;if(Number(stage.typeId)!==TYPE_ID||stage.code!=='archive_handoff')throw new ArchiveError('UNEXPECTED_HANDOFF_STAGE');}
+    if(review){const stage=(await api.call('rpa.stage.get',{id:review.stageId})).result.stage;if(Number(stage.typeId)!==TYPE_ID||stage.code!=='client_review')throw new ArchiveError('UNEXPECTED_CLIENT_REVIEW_STAGE');}
     verified=true;
     if (!await lease.acquire()) { log({ event: 'lease_busy' }); return; }
     let start = 0, processed = 0;
@@ -661,8 +669,9 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
           await locked(item.id,async()=>{
             if (cancellationEnabled) await controls.cancel(item.id, { dryRun: false });
             const current=await api.getItem(item.id);
-            if(handoff && Number(current.stageId)===handoff.stageId)return;
+            if((handoff && Number(current.stageId)===handoff.stageId)||(review&&Number(current.stageId)===review.stageId))return;
             await archiver.process(current);
+            await billingLink(await api.getItem(item.id));
             if (feedbackEnabled) await controls.recover(item.id);
             if(summariesEnabled && ![315,317].includes(Number(current.stageId)))await summaries.update(item.id);
           });
@@ -681,17 +690,18 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
     if(!verified||!await lease.acquire())return;
     let start=0;
     for(;;){
-      const activeStages=[309,311,313,319,321,323,325,327,329,331,333,335,337,339,handoff.stageId];
-      const page=await api.call('rpa.item.list',{typeId:TYPE_ID,filter:{stageId:summariesEnabled?activeStages:handoff.stageId},start,order:{id:'ASC'}});
+      const activeStages=[309,311,313,319,321,323,325,327,329,331,333,335,337,339,...[handoff?.stageId,review?.stageId].filter(Boolean)];
+      const page=await api.call('rpa.item.list',{typeId:TYPE_ID,filter:{stageId:summariesEnabled?activeStages:[handoff?.stageId,review?.stageId].filter(Boolean)},start,order:{id:'ASC'}});
       if(!Array.isArray(page.result?.items))throw new ArchiveError('INVALID_HANDOFF_LIST');
-      const prioritized=[...page.result.items].sort((a,b)=>(Number(b.stageId)===handoff.stageId)-(Number(a.stageId)===handoff.stageId));
+      const prioritized=[...page.result.items].sort((a,b)=>(Number(b.stageId)===handoff?.stageId)-(Number(a.stageId)===handoff?.stageId));
       for(const item of prioritized){
         if(stopped)break;
         // Never rely on a server-side filter alone before a mutation.
         if(!activeStages.includes(Number(item.stageId)))continue;
         if(allow.size&&!allow.has(String(item.id)))continue;
         try{
-          if(Number(item.stageId)===handoff.stageId){const result=await locked(item.id,()=>handoff.process(item.id));if(result.transferred)log({event:'handoff_complete',itemId:item.id,from:result.from,target:result.target,files:result.files});}
+          if(review&&Number(item.stageId)===review.stageId){const result=await locked(item.id,()=>review.process(item.id));if(result.transferred)log({event:'client_review_complete',itemId:item.id,target:result.target,manual:result.manual,changes:result.changes});}
+          else if(handoff&&Number(item.stageId)===handoff.stageId){const result=await locked(item.id,()=>handoff.process(item.id));if(result.transferred)log({event:'handoff_complete',itemId:item.id,from:result.from,target:result.target,files:result.files});}
           else if(summariesEnabled&&!String(item[P+'ROLE_SUMMARY']||'').startsWith(buildRoleSummary(item).text.split('\n')[0]+'\n'))await locked(item.id,()=>summaries.update(item.id));
         }
         catch(error){await report(item.id,error);}
@@ -711,7 +721,7 @@ export function startLegalArchiveFromEnv(env = process.env, { logger = console.l
       .finally(() => { if (!stopped) { timer = setTimeout(tick, pollMs); timer.unref?.(); } });
   };
   timer = setTimeout(tick, 1000); timer.unref?.();
-  if(handoff){priorityTimer=setTimeout(priorityTick,2000);priorityTimer.unref?.();}
+  if(handoff||review){priorityTimer=setTimeout(priorityTick,2000);priorityTimer.unref?.();}
   return { enabled: true, async stop() {
     stopped = true; clearTimeout(timer);clearTimeout(priorityTimer);
     await Promise.allSettled([running,priorityRunning]);
