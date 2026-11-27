@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import { mountLinkedBilling } from './billing-app/routes.mjs';
 import { startLegalArchiveSafely } from './legal-archive.mjs';
 import { BitrixClient } from './bitrix.mjs';
 import {
@@ -29,6 +30,8 @@ let scoringPollPromise;
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+mountLinkedBilling(app,{enabled:process.env.LEGAL_BILLING_APP_ENABLED==='true'});
 
 app.get('/health', (_request, response) => {
   response.json({ ok: true });
